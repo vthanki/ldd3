@@ -27,6 +27,8 @@
 #include <linux/spinlock.h>
 #include <linux/interrupt.h>
 #include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/debugfs.h>
 
 #include <asm/hardirq.h>
 /*
@@ -43,18 +45,151 @@ MODULE_LICENSE("Dual BSD/GPL");
 
 /* use these as data pointers, to implement four files in one function */
 enum jit_files {
-	JIT_BUSY,
+	JIT_BUSY = 0x1,
 	JIT_SCHED,
 	JIT_QUEUE,
-	JIT_SCHEDTO
+	JIT_SCHEDTO,
+	JIT_TIMER,
+	JIT_TASKLET,
+	JIT_TASKLET_HI
 };
 
 /*
- * This function prints one line of data, after sleeping one second.
- * It can sleep in different ways, according to the data pointer
+ * The timer example follows
  */
-int jit_fn(char *buf, char **start, off_t offset,
-	      int len, int *eof, void *data)
+
+int tdelay = 10;
+module_param(tdelay, int, 0);
+
+/* This data structure used as "data" for the timer and tasklet functions */
+struct jit_data {
+	struct timer_list timer;
+	struct tasklet_struct tlet;
+	int hi; /* tasklet or tasklet_hi */
+	wait_queue_head_t wait;
+	unsigned long prevjiffies;
+	void *priv;
+	int loops;
+};
+#define JIT_ASYNC_LOOPS 5
+
+void jit_timer_fn(unsigned long arg)
+{
+	struct jit_data *data = (struct jit_data *)arg;
+	unsigned long j = jiffies;
+	seq_printf((struct seq_file *)data->priv,
+			"%9li  %3li     %i    %6i   %i   %s\n",
+			 j, j - data->prevjiffies, in_interrupt() ? 1 : 0,
+			 current->pid, smp_processor_id(), current->comm);
+
+	if (--data->loops) {
+		data->timer.expires += tdelay;
+		data->prevjiffies = j;
+		add_timer(&data->timer);
+	} else {
+		wake_up_interruptible(&data->wait);
+	}
+}
+
+/* the /proc function: allocate everything to allow concurrency */
+static int jit_timer(struct seq_file *s, void *unused)
+{
+	struct jit_data *data;
+	unsigned long j = jiffies;
+
+	data = kmalloc(sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+
+	init_timer(&data->timer);
+	init_waitqueue_head (&data->wait);
+
+	/* write the first lines in the buffer */
+	seq_printf(s, "   time   delta  inirq    pid   cpu command\n");
+	seq_printf(s, "%9li  %3li     %i    %6i   %i   %s\n",
+			j, 0L, in_interrupt() ? 1 : 0,
+			current->pid, smp_processor_id(), current->comm);
+
+	/* fill the data for our timer function */
+	data->prevjiffies = j;
+	data->priv = (void *)s;
+	data->loops = JIT_ASYNC_LOOPS;
+
+	/* register the timer */
+	data->timer.data = (unsigned long)data;
+	data->timer.function = jit_timer_fn;
+	data->timer.expires = j + tdelay; /* parameter */
+	add_timer(&data->timer);
+
+	/* wait for the buffer to fill */
+	wait_event_interruptible(data->wait, !data->loops);
+	if (signal_pending(current))
+		return -ERESTARTSYS;
+	kfree(data);
+	return 0;
+}
+
+static void jit_tasklet_fn(unsigned long arg)
+{
+	struct jit_data *data = (struct jit_data *)arg;
+	unsigned long j = jiffies;
+	seq_printf((struct seq_file *)data->priv,
+			"%9li  %3li     %i    %6i   %i   %s\n",
+			 j, j - data->prevjiffies, in_interrupt() ? 1 : 0,
+			 current->pid, smp_processor_id(), current->comm);
+
+	if (--data->loops) {
+		data->prevjiffies = j;
+		if (data->hi)
+			tasklet_hi_schedule(&data->tlet);
+		else
+			tasklet_schedule(&data->tlet);
+	} else {
+		wake_up_interruptible(&data->wait);
+	}
+}
+
+/* the /proc function: allocate everything to allow concurrency */
+static int jit_tasklet(struct seq_file *s, int tasklet_hi)
+{
+	struct jit_data *data;
+	unsigned long j = jiffies;
+
+	data = kmalloc(sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+
+	init_waitqueue_head (&data->wait);
+
+	/* write the first lines in the buffer */
+	seq_printf(s, "   time   delta  inirq    pid   cpu command\n");
+	seq_printf(s, "%9li  %3li     %i    %6i   %i   %s\n",
+			j, 0L, in_interrupt() ? 1 : 0,
+			current->pid, smp_processor_id(), current->comm);
+
+	/* fill the data for our tasklet function */
+	data->prevjiffies = j;
+	data->priv = (void *)s;
+	data->loops = JIT_ASYNC_LOOPS;
+
+	/* register the tasklet */
+	tasklet_init(&data->tlet, jit_tasklet_fn, (unsigned long)data);
+	data->hi = tasklet_hi;
+	if (tasklet_hi)
+		tasklet_hi_schedule(&data->tlet);
+	else
+		tasklet_schedule(&data->tlet);
+
+	/* wait for the buffer to fill */
+	wait_event_interruptible(data->wait, !data->loops);
+
+	if (signal_pending(current))
+		return -ERESTARTSYS;
+	kfree(data);
+	return 0;
+}
+
+static int jit_common_show(struct seq_file *s, void *unused)
 {
 	unsigned long j0, j1; /* jiffies */
 	wait_queue_head_t wait;
@@ -63,7 +198,7 @@ int jit_fn(char *buf, char **start, off_t offset,
 	j0 = jiffies;
 	j1 = j0 + delay;
 
-	switch((long)data) {
+	switch((long)s->private) {
 		case JIT_BUSY:
 			while (time_before(jiffies, j1))
 				cpu_relax();
@@ -80,24 +215,36 @@ int jit_fn(char *buf, char **start, off_t offset,
 			set_current_state(TASK_INTERRUPTIBLE);
 			schedule_timeout (delay);
 			break;
+		case JIT_TIMER:
+			jit_timer(s, NULL);
+			goto timer_exit;
+		case JIT_TASKLET:
+			jit_tasklet(s, 0);
+			goto tasklet_exit;
+		case JIT_TASKLET_HI:
+			jit_tasklet(s, 1);
+			goto tasklet_hi_exit;
+
 	}
 	j1 = jiffies; /* actual value after we delayed */
 
-	len = sprintf(buf, "%9li %9li\n", j0, j1);
-	*start = buf;
-	return len;
+	seq_printf(s, "%9li %9li\n", j0, j1);
+
+timer_exit:
+tasklet_exit:
+tasklet_hi_exit:
+	return 0;
 }
 
-/*
- * This file, on the other hand, returns the current time forever
- */
-int jit_currentime(char *buf, char **start, off_t offset,
-                   int len, int *eof, void *data)
+static int jit_show(struct seq_file *s, void *unused)
 {
 	struct timeval tv1;
 	struct timespec tv2;
 	unsigned long j1;
 	u64 j2;
+
+	if (s->private)
+		return 	jit_common_show(s, NULL);
 
 	/* get them four */
 	j1 = jiffies;
@@ -106,171 +253,40 @@ int jit_currentime(char *buf, char **start, off_t offset,
 	tv2 = current_kernel_time();
 
 	/* print */
-	len=0;
-	len += sprintf(buf,"0x%08lx 0x%016Lx %10i.%06i\n"
-		       "%40i.%09i\n",
-		       j1, j2,
-		       (int) tv1.tv_sec, (int) tv1.tv_usec,
-		       (int) tv2.tv_sec, (int) tv2.tv_nsec);
-	*start = buf;
-	return len;
+	seq_printf(s,"0x%08lx 0x%016Lx %10i.%06i\n"
+			"%40i.%09i\n",
+			j1, j2,
+			(int) tv1.tv_sec, (int) tv1.tv_usec,
+			(int) tv2.tv_sec, (int) tv2.tv_nsec);
+
+	return 0;
 }
 
-/*
- * The timer example follows
- */
 
-int tdelay = 10;
-module_param(tdelay, int, 0);
+static int jit_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, jit_show, PDE_DATA(inode));
+}
 
-/* This data structure used as "data" for the timer and tasklet functions */
-struct jit_data {
-	struct timer_list timer;
-	struct tasklet_struct tlet;
-	int hi; /* tasklet or tasklet_hi */
-	wait_queue_head_t wait;
-	unsigned long prevjiffies;
-	unsigned char *buf;
-	int loops;
+static const struct file_operations jit_ops = {
+	.owner = THIS_MODULE,
+	.open = jit_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = seq_release,
 };
-#define JIT_ASYNC_LOOPS 5
-
-void jit_timer_fn(unsigned long arg)
-{
-	struct jit_data *data = (struct jit_data *)arg;
-	unsigned long j = jiffies;
-	data->buf += sprintf(data->buf, "%9li  %3li     %i    %6i   %i   %s\n",
-			     j, j - data->prevjiffies, in_interrupt() ? 1 : 0,
-			     current->pid, smp_processor_id(), current->comm);
-
-	if (--data->loops) {
-		data->timer.expires += tdelay;
-		data->prevjiffies = j;
-		add_timer(&data->timer);
-	} else {
-		wake_up_interruptible(&data->wait);
-	}
-}
-
-/* the /proc function: allocate everything to allow concurrency */
-int jit_timer(char *buf, char **start, off_t offset,
-	      int len, int *eof, void *unused_data)
-{
-	struct jit_data *data;
-	char *buf2 = buf;
-	unsigned long j = jiffies;
-
-	data = kmalloc(sizeof(*data), GFP_KERNEL);
-	if (!data)
-		return -ENOMEM;
-
-	init_timer(&data->timer);
-	init_waitqueue_head (&data->wait);
-
-	/* write the first lines in the buffer */
-	buf2 += sprintf(buf2, "   time   delta  inirq    pid   cpu command\n");
-	buf2 += sprintf(buf2, "%9li  %3li     %i    %6i   %i   %s\n",
-			j, 0L, in_interrupt() ? 1 : 0,
-			current->pid, smp_processor_id(), current->comm);
-
-	/* fill the data for our timer function */
-	data->prevjiffies = j;
-	data->buf = buf2;
-	data->loops = JIT_ASYNC_LOOPS;
-	
-	/* register the timer */
-	data->timer.data = (unsigned long)data;
-	data->timer.function = jit_timer_fn;
-	data->timer.expires = j + tdelay; /* parameter */
-	add_timer(&data->timer);
-
-	/* wait for the buffer to fill */
-	wait_event_interruptible(data->wait, !data->loops);
-	if (signal_pending(current))
-		return -ERESTARTSYS;
-	buf2 = data->buf;
-	kfree(data);
-	*eof = 1;
-	return buf2 - buf;
-}
-
-void jit_tasklet_fn(unsigned long arg)
-{
-	struct jit_data *data = (struct jit_data *)arg;
-	unsigned long j = jiffies;
-	data->buf += sprintf(data->buf, "%9li  %3li     %i    %6i   %i   %s\n",
-			     j, j - data->prevjiffies, in_interrupt() ? 1 : 0,
-			     current->pid, smp_processor_id(), current->comm);
-
-	if (--data->loops) {
-		data->prevjiffies = j;
-		if (data->hi)
-			tasklet_hi_schedule(&data->tlet);
-		else
-			tasklet_schedule(&data->tlet);
-	} else {
-		wake_up_interruptible(&data->wait);
-	}
-}
-
-/* the /proc function: allocate everything to allow concurrency */
-int jit_tasklet(char *buf, char **start, off_t offset,
-	      int len, int *eof, void *arg)
-{
-	struct jit_data *data;
-	char *buf2 = buf;
-	unsigned long j = jiffies;
-	long hi = (long)arg;
-
-	data = kmalloc(sizeof(*data), GFP_KERNEL);
-	if (!data)
-		return -ENOMEM;
-
-	init_waitqueue_head (&data->wait);
-
-	/* write the first lines in the buffer */
-	buf2 += sprintf(buf2, "   time   delta  inirq    pid   cpu command\n");
-	buf2 += sprintf(buf2, "%9li  %3li     %i    %6i   %i   %s\n",
-			j, 0L, in_interrupt() ? 1 : 0,
-			current->pid, smp_processor_id(), current->comm);
-
-	/* fill the data for our tasklet function */
-	data->prevjiffies = j;
-	data->buf = buf2;
-	data->loops = JIT_ASYNC_LOOPS;
-	
-	/* register the tasklet */
-	tasklet_init(&data->tlet, jit_tasklet_fn, (unsigned long)data);
-	data->hi = hi;
-	if (hi)
-		tasklet_hi_schedule(&data->tlet);
-	else
-		tasklet_schedule(&data->tlet);
-
-	/* wait for the buffer to fill */
-	wait_event_interruptible(data->wait, !data->loops);
-
-	if (signal_pending(current))
-		return -ERESTARTSYS;
-	buf2 = data->buf;
-	kfree(data);
-	*eof = 1;
-	return buf2 - buf;
-}
-
 
 
 int __init jit_init(void)
 {
-	create_proc_read_entry("currentime", 0, NULL, jit_currentime, NULL);
-	create_proc_read_entry("jitbusy", 0, NULL, jit_fn, (void *)JIT_BUSY);
-	create_proc_read_entry("jitsched",0, NULL, jit_fn, (void *)JIT_SCHED);
-	create_proc_read_entry("jitqueue",0, NULL, jit_fn, (void *)JIT_QUEUE);
-	create_proc_read_entry("jitschedto", 0, NULL, jit_fn, (void *)JIT_SCHEDTO);
-
-	create_proc_read_entry("jitimer", 0, NULL, jit_timer, NULL);
-	create_proc_read_entry("jitasklet", 0, NULL, jit_tasklet, NULL);
-	create_proc_read_entry("jitasklethi", 0, NULL, jit_tasklet, (void *)1);
+	proc_create_data("currentime", 0, NULL, &jit_ops, NULL);
+	proc_create_data("jitbusy", 0, NULL, &jit_ops, (void *)JIT_BUSY);
+	proc_create_data("jitsched", 0, NULL, &jit_ops, (void *)JIT_SCHED);
+	proc_create_data("jitqueue", 0, NULL, &jit_ops, (void *)JIT_QUEUE);
+	proc_create_data("jitschedto", 0, NULL, &jit_ops, (void *)JIT_SCHEDTO);
+	proc_create_data("jitimer", 0, NULL, &jit_ops, (void *)JIT_TIMER);
+	proc_create_data("jitasklet", 0, NULL, &jit_ops, (void *)JIT_TASKLET);
+	proc_create_data("jitasklethi", 0, NULL, &jit_ops, (void *)JIT_TASKLET_HI);
 
 	return 0; /* success */
 }
@@ -282,7 +298,6 @@ void __exit jit_cleanup(void)
 	remove_proc_entry("jitsched", NULL);
 	remove_proc_entry("jitqueue", NULL);
 	remove_proc_entry("jitschedto", NULL);
-
 	remove_proc_entry("jitimer", NULL);
 	remove_proc_entry("jitasklet", NULL);
 	remove_proc_entry("jitasklethi", NULL);
