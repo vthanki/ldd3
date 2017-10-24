@@ -65,7 +65,7 @@ static int sculld_vma_nopage(struct vm_area_struct *vma, struct vm_fault *vmf)
 	int retval = VM_FAULT_NOPAGE;
 
 	down(&dev->sem);
-	offset = (unsigned long)(vmf->virtual_address - vma->vm_start) + (vma->vm_pgoff << PAGE_SHIFT);
+	offset = (unsigned long)(vmf->address - vma->vm_start) + (vma->vm_pgoff << PAGE_SHIFT);
 	if (offset >= dev->size) goto out; /* out of range */
 
 	/*
