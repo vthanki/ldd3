@@ -393,7 +393,7 @@ loff_t sculld_llseek (struct file *filp, loff_t off, int whence)
 	return newpos;
 }
 
-
+#if 0
 /*
  * A simple asynchronous I/O implementation.
  */
@@ -465,7 +465,7 @@ static ssize_t sculld_aio_write(struct kiocb *iocb, const struct iovec *iovec,
 }
 
 
- 
+#endif
 /*
  * Mmap *is* available, but confined in a different file
  */
@@ -485,8 +485,10 @@ struct file_operations sculld_fops = {
 	.mmap =	     sculld_mmap,
 	.open =	     sculld_open,
 	.release =   sculld_release,
+#if 0
 	.aio_read =  sculld_aio_read,
 	.aio_write = sculld_aio_write,
+#endif
 };
 
 int sculld_trim(struct sculld_dev *dev)
