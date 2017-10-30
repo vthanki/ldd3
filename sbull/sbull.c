@@ -116,7 +116,7 @@ static void sbull_request(struct request_queue *q)
     //    			req->sector, req->current_nr_sectors,
     //    			req->flags);
 		sbull_transfer(dev, blk_rq_pos(req), blk_rq_cur_sectors(req),
-				req->buffer, rq_data_dir(req));
+				bio_data(req->bio), rq_data_dir(req));
 		__blk_end_request_cur(req, 0);
 	}
 }
@@ -127,17 +127,17 @@ static void sbull_request(struct request_queue *q)
  */
 static int sbull_xfer_bio(struct sbull_dev *dev, struct bio *bio)
 {
-	int i;
-	struct bio_vec *bvec;
-	sector_t sector = bio->bi_sector;
+	struct bvec_iter i;
+	struct bio_vec bvec;
+	sector_t sector = bio->bi_iter.bi_sector;
 
 	/* Do each segment independently. */
 	bio_for_each_segment(bvec, bio, i) {
-		char *buffer = __bio_kmap_atomic(bio, i, KM_USER0);
+		char *buffer = __bio_kmap_atomic(bio, i);
 		sbull_transfer(dev, sector, bio_cur_bytes(bio) >> 9,
 				buffer, bio_data_dir(bio) == WRITE);
 		sector += bio_cur_bytes(bio) >> 9;
-		__bio_kunmap_atomic(buffer, KM_USER0);
+		__bio_kunmap_atomic(buffer);
 	}
 	return 0; /* Always "succeed" */
 }
@@ -148,13 +148,11 @@ static int sbull_xfer_bio(struct sbull_dev *dev, struct bio *bio)
 static int sbull_xfer_request(struct sbull_dev *dev, struct request *req)
 {
 	struct bio *bio;
-	int nsect = 0;
-    
+
 	__rq_for_each_bio(bio, req) {
 		sbull_xfer_bio(dev, bio);
-		nsect += bio->bi_size/KERNEL_SECTOR_SIZE;
 	}
-	return nsect;
+	return blk_rq_sectors(req);
 }
 
 
@@ -184,13 +182,14 @@ static void sbull_full_request(struct request_queue *q)
 /*
  * The direct make request version.
  */
-static void sbull_make_request(struct request_queue *q, struct bio *bio)
+static blk_qc_t sbull_make_request(struct request_queue *q, struct bio *bio)
 {
 	struct sbull_dev *dev = q->queuedata;
 	int status;
 
 	status = sbull_xfer_bio(dev, bio);
-	bio_endio(bio, status);
+	bio_endio(bio);
+	return BLK_QC_T_NONE;
 }
 
 
@@ -205,7 +204,7 @@ static int sbull_open(struct block_device *bdev, fmode_t mode)
 	del_timer_sync(&dev->timer);
 	//filp->private_data = dev;
 	spin_lock(&dev->lock);
-	if (! dev->users) 
+	if (! dev->users)
 		check_disk_change(bdev);
 	dev->users++;
 	spin_unlock(&dev->lock);
@@ -232,7 +231,7 @@ static void sbull_release(struct gendisk *disk, fmode_t mode)
 int sbull_media_changed(struct gendisk *gd)
 {
 	struct sbull_dev *dev = gd->private_data;
-	
+
 	return dev->media_change;
 }
 
@@ -243,7 +242,7 @@ int sbull_media_changed(struct gendisk *gd)
 int sbull_revalidate(struct gendisk *gd)
 {
 	struct sbull_dev *dev = gd->private_data;
-	
+
 	if (dev->media_change) {
 		dev->media_change = 0;
 		memset (dev->data, 0, dev->size);
@@ -260,7 +259,7 @@ void sbull_invalidate(unsigned long ldev)
 	struct sbull_dev *dev = (struct sbull_dev *) ldev;
 
 	spin_lock(&dev->lock);
-	if (dev->users || !dev->data) 
+	if (dev->users || !dev->data)
 		printk (KERN_WARNING "sbull: timer sanity check failed\n");
 	else
 		dev->media_change = 1;
@@ -330,14 +329,14 @@ static void setup_device(struct sbull_dev *dev, int which)
 		return;
 	}
 	spin_lock_init(&dev->lock);
-	
+
 	/*
 	 * The timer which "invalidates" the device.
 	 */
 	init_timer(&dev->timer);
 	dev->timer.data = (unsigned long) dev;
 	dev->timer.function = sbull_invalidate;
-	
+
 	/*
 	 * The I/O queue, depending on whether we are using our own
 	 * make_request function or not.
@@ -359,7 +358,7 @@ static void setup_device(struct sbull_dev *dev, int which)
 	    default:
 		printk(KERN_NOTICE "Bad request mode %d, using simple\n", request_mode);
         	/* fall into.. */
-	
+
 	    case RM_SIMPLE:
 		dev->queue = blk_init_queue(sbull_request, &dev->lock);
 		if (dev->queue == NULL)
@@ -410,9 +409,9 @@ static int __init sbull_init(void)
 	Devices = kmalloc(ndevices*sizeof (struct sbull_dev), GFP_KERNEL);
 	if (Devices == NULL)
 		goto out_unregister;
-	for (i = 0; i < ndevices; i++) 
+	for (i = 0; i < ndevices; i++)
 		setup_device(Devices + i, i);
-    
+
 	return 0;
 
   out_unregister:
@@ -444,6 +443,6 @@ static void sbull_exit(void)
 	unregister_blkdev(sbull_major, "sbull");
 	kfree(Devices);
 }
-	
+
 module_init(sbull_init);
 module_exit(sbull_exit);
